@@ -1,6 +1,5 @@
 /*
- Package horizonclient provides client access to a Horizon server, allowing an application to post
- transactions and look up ledger information.
+Package horizonclient provides client access to a Horizon server, allowing an application to post transactions and look up ledger information.
 
 This library provides an interface to the Stellar Horizon service. It supports the building of Go applications on
 top of the Stellar network (https://www.stellar.org/). Transactions may be constructed using the sister package to
