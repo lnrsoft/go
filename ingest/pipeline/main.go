@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"sync"
+	"time"
 
 	"github.com/stellar/go/ingest/io"
 	"github.com/stellar/go/xdr"
@@ -9,15 +10,18 @@ import (
 
 type bufferedStateReadWriteCloser struct {
 	initOnce sync.Once
-	// closed   chan bool
 	buffer   chan xdr.LedgerEntry
+
+	readEntries  int
+	wroteEntries int
 }
 
 type multiWriteCloser struct {
 	writers []io.StateWriteCloser
 
-	mutex sync.Mutex
-	closeAfter int
+	mutex        sync.Mutex
+	closeAfter   int
+	wroteEntries int
 }
 
 type Pipeline struct {
@@ -28,6 +32,14 @@ type Pipeline struct {
 type PipelineNode struct {
 	Processor StateProcessor
 	Children  []*PipelineNode
+
+	duration        time.Duration
+	jobs            int
+	readEntries     int
+	readsPerSecond  int
+	queuedEntries   int
+	wroteEntries    int
+	writesPerSecond int
 }
 
 // StateProcessor defines methods required by state processing pipeline.
@@ -52,6 +64,7 @@ type StateProcessor interface {
 	// writes to `writer` will go to "void".
 	// This is useful for processors resposible for saving aggregated data that don't
 	// need state objects.
+	// TODO!
 	RequiresInput() bool
 	// Returns processor name. Helpful for errors, debuging and reports.
 	Name() string

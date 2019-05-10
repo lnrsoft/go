@@ -1,7 +1,10 @@
 package pipeline
 
 import (
+	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/stellar/go/ingest/io"
 )
@@ -9,6 +12,50 @@ import (
 func (p *Pipeline) Node(processor StateProcessor) *PipelineNode {
 	return &PipelineNode{
 		Processor: processor,
+	}
+}
+
+func (p *Pipeline) PrintStatus() {
+	p.printNodeStatus(p.rootStateProcessor, 0)
+}
+
+func (p *Pipeline) printNodeStatus(node *PipelineNode, level int) {
+	fmt.Print(strings.Repeat("  ", level))
+
+	var wrRatio = float32(0)
+	if node.readEntries > 0 {
+		wrRatio = float32(node.wroteEntries) / float32(node.readEntries)
+	}
+
+	icon := ""
+	if node.queuedEntries > bufferSize/10*9 {
+		icon = "⚠️ "
+	}
+
+	fmt.Printf(
+		"└ %s%s read=%d (queued=%d rps=%d) wrote=%d (w/r ratio = %1.5f) concurrent=%t jobs=%d\n",
+		icon,
+		node.Processor.Name(),
+		node.readEntries,
+		node.queuedEntries,
+		node.readsPerSecond,
+		node.wroteEntries,
+		wrRatio,
+		node.Processor.IsConcurrent(),
+		node.jobs,
+	)
+
+	if node.jobs > 1 {
+		fmt.Print(strings.Repeat("  ", level))
+		fmt.Print("  ")
+		for i := 0; i < node.jobs; i++ {
+			fmt.Print("• ")
+		}
+		fmt.Println("")
+	}
+
+	for _, child := range node.Children {
+		p.printNodeStatus(child, level+1)
 	}
 }
 
@@ -28,14 +75,16 @@ func (p *Pipeline) processStateNode(store *Store, node *PipelineNode, reader io.
 	}
 
 	var wg sync.WaitGroup
-	
+
 	jobs := 1
 	if node.Processor.IsConcurrent() {
-		jobs = 10
+		jobs = 20
 	}
 
+	node.jobs = jobs
+
 	writer := &multiWriteCloser{
-		writers: outputs,
+		writers:    outputs,
 		closeAfter: jobs,
 	}
 
@@ -43,6 +92,7 @@ func (p *Pipeline) processStateNode(store *Store, node *PipelineNode, reader io.
 		wg.Add(1)
 		go func(reader io.StateReader, writer io.StateWriteCloser) {
 			defer wg.Done()
+
 			err := node.Processor.ProcessState(store, reader, writer)
 			if err != nil {
 				// TODO return to pipeline error channel
@@ -50,6 +100,25 @@ func (p *Pipeline) processStateNode(store *Store, node *PipelineNode, reader io.
 			}
 		}(reader, writer)
 	}
+
+	go func() {
+		// Update stats
+		for {
+			readBuffer := reader.(*bufferedStateReadWriteCloser)
+			writeBuffer := writer
+
+			interval := time.Second
+
+			node.readsPerSecond = (readBuffer.readEntries - node.readEntries) * int(time.Second/interval)
+			node.writesPerSecond = (writeBuffer.wroteEntries - node.wroteEntries) * int(time.Second/interval)
+
+			node.wroteEntries = writeBuffer.wroteEntries
+			node.readEntries = readBuffer.readEntries
+			node.queuedEntries = readBuffer.QueuedEntries()
+
+			time.Sleep(interval)
+		}
+	}()
 
 	for i, child := range node.Children {
 		wg.Add(1)

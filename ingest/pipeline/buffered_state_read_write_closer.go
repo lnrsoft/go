@@ -1,11 +1,11 @@
 package pipeline
 
 import (
-	"github.com/stellar/go/xdr"
 	"github.com/stellar/go/ingest/io"
+	"github.com/stellar/go/xdr"
 )
 
-const bufferSize = 2000
+const bufferSize = 50000
 
 func (b *bufferedStateReadWriteCloser) init() {
 	b.buffer = make(chan xdr.LedgerEntry, bufferSize)
@@ -20,6 +20,7 @@ func (b *bufferedStateReadWriteCloser) Read() (xdr.LedgerEntry, error) {
 
 	entry, more := <-b.buffer
 	if more {
+		b.readEntries++
 		return entry, nil
 	} else {
 		return xdr.LedgerEntry{}, io.EOF
@@ -29,7 +30,13 @@ func (b *bufferedStateReadWriteCloser) Read() (xdr.LedgerEntry, error) {
 func (b *bufferedStateReadWriteCloser) Write(entry xdr.LedgerEntry) error {
 	b.initOnce.Do(b.init)
 	b.buffer <- entry
+	b.wroteEntries++
 	return nil
+}
+
+func (b *bufferedStateReadWriteCloser) QueuedEntries() int {
+	b.initOnce.Do(b.init)
+	return len(b.buffer)
 }
 
 func (b *bufferedStateReadWriteCloser) Close() error {

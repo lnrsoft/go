@@ -1,16 +1,42 @@
 package pipeline
 
 import (
+	"sync"
+
+	"github.com/stellar/go/ingest/io"
 	"github.com/stellar/go/xdr"
 )
 
-func (t *multiWriteCloser) Write(entry xdr.LedgerEntry) error {
-	for _, w := range t.writers {
-		err := w.Write(entry)
+func (m *multiWriteCloser) Write(entry xdr.LedgerEntry) error {
+	m.mutex.Lock()
+	m.wroteEntries++
+	m.mutex.Unlock()
+
+	var wg sync.WaitGroup
+	results := make(chan error, len(m.writers))
+
+	for _, w := range m.writers {
+		wg.Add(1)
+		go func(w io.StateWriteCloser) {
+			defer wg.Done()
+			err := w.Write(entry)
+			if err != nil {
+				results <- err
+			} else {
+				results <- nil
+			}
+		}(w)
+	}
+
+	wg.Wait()
+
+	for range m.writers {
+		err := <-results
 		if err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 

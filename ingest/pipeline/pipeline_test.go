@@ -2,17 +2,19 @@ package pipeline
 
 import (
 	"fmt"
+	"math/rand"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
-	"sync"
-	"strings"
 
 	"github.com/stellar/go/ingest/io"
-	"github.com/stellar/go/xdr"
 	"github.com/stellar/go/keypair"
+	"github.com/stellar/go/xdr"
 )
 
-func AccountLedgerEntry() xdr.LedgerEntry {
+func randomAccountId() xdr.AccountId {
 	random, err := keypair.Random()
 	if err != nil {
 		panic(err)
@@ -20,13 +22,48 @@ func AccountLedgerEntry() xdr.LedgerEntry {
 
 	id := xdr.AccountId{}
 	id.SetAddress(random.Address())
+	return id
+}
+
+func randomSignerKey() xdr.SignerKey {
+	random, err := keypair.Random()
+	if err != nil {
+		panic(err)
+	}
+
+	id := xdr.SignerKey{}
+	err = id.SetAddress(random.Address())
+	if err != nil {
+		panic(err)
+	}
+
+	return id
+}
+
+func AccountLedgerEntry() xdr.LedgerEntry {
+	specialSigner := xdr.SignerKey{}
+	err := specialSigner.SetAddress("GCS26OX27PF67V22YYCTBLW3A4PBFAL723QG3X3FQYEL56FXX2C7RX5G")
+	if err != nil {
+		panic(err)
+	}
+
+	signer := specialSigner
+	if rand.Int()%100 >= 1 /* % */ {
+		signer = randomSignerKey()
+	}
 
 	return xdr.LedgerEntry{
 		LastModifiedLedgerSeq: 0,
 		Data: xdr.LedgerEntryData{
 			Type: xdr.LedgerEntryTypeAccount,
 			Account: &xdr.AccountEntry{
-				AccountId: id,
+				AccountId: randomAccountId(),
+				Signers: []xdr.Signer{
+					xdr.Signer{
+						Key:    signer,
+						Weight: 1,
+					},
+				},
 			},
 		},
 	}
@@ -85,7 +122,7 @@ func TestBuffer(t *testing.T) {
 				}
 			}
 			fmt.Println("Read", entry.Data.Account.AccountId.Address())
-			time.Sleep(4*time.Second)
+			time.Sleep(4 * time.Second)
 		}
 	}()
 
@@ -106,30 +143,41 @@ func TestPipeline(t *testing.T) {
 	pipeline := &Pipeline{}
 
 	passthroughProcessor := &PassthroughProcessor{}
-	accountsOnlyFilter := &AccountsOnlyFilter{}
-	printProcessor := &PrintProcessor{}
+	accountsOnlyFilter := &EntryTypeFilter{Type: xdr.LedgerEntryTypeAccount}
+	trustLinesOnlyFilter := &EntryTypeFilter{Type: xdr.LedgerEntryTypeTrustline}
+	printCountersProcessor := &PrintCountersProcessor{}
+	printAllProcessor := &PrintAllProcessor{}
 
 	pipeline.AddStateProcessorTree(
 		pipeline.Node(passthroughProcessor).
 			Pipe(
+				// Passes accounts only
 				pipeline.Node(accountsOnlyFilter).
 					Pipe(
+						// Finds accounts for a single signer
+						pipeline.Node(&AccountsForSignerProcessor{Signer: "GCS26OX27PF67V22YYCTBLW3A4PBFAL723QG3X3FQYEL56FXX2C7RX5G"}).
+							Pipe(pipeline.Node(printAllProcessor)),
+
+						// Counts accounts with prefix GA/GB/GC/GD and stores results in a store
 						pipeline.Node(&CountPrefixProcessor{Prefix: "GA"}).
-							Pipe(pipeline.Node(printProcessor)),
+							Pipe(pipeline.Node(printCountersProcessor)),
 						pipeline.Node(&CountPrefixProcessor{Prefix: "GB"}).
-							Pipe(pipeline.Node(printProcessor)),
+							Pipe(pipeline.Node(printCountersProcessor)),
 						pipeline.Node(&CountPrefixProcessor{Prefix: "GC"}).
-							Pipe(pipeline.Node(printProcessor)),
+							Pipe(pipeline.Node(printCountersProcessor)),
 						pipeline.Node(&CountPrefixProcessor{Prefix: "GD"}).
-							Pipe(pipeline.Node(printProcessor)),
+							Pipe(pipeline.Node(printCountersProcessor)),
 					),
-				),
+				// Passes trust lines only
+				pipeline.Node(trustLinesOnlyFilter).
+					Pipe(pipeline.Node(printAllProcessor)),
+			),
 	)
 
 	buffer := &bufferedStateReadWriteCloser{}
-	
+
 	go func() {
-		for i := 0; i < 10000; i++ {
+		for i := 0; i < 1000000; i++ {
 			buffer.Write(AccountLedgerEntry())
 			buffer.Write(TrustLineLedgerEntry())
 		}
@@ -137,10 +185,40 @@ func TestPipeline(t *testing.T) {
 	}()
 
 	done := pipeline.ProcessState(buffer)
+	startTime := time.Now()
+
+	go func() {
+		for {
+			fmt.Print("\033[H\033[2J")
+
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+
+			fmt.Printf("Alloc = %v MiB", bToMb(m.Alloc))
+			fmt.Printf("\tHeapAlloc = %v MiB", bToMb(m.HeapAlloc))
+			fmt.Printf("\tSys = %v MiB", bToMb(m.Sys))
+			fmt.Printf("\tNumGC = %v", m.NumGC)
+			fmt.Printf("\tGoroutines = %v", runtime.NumGoroutine())
+			fmt.Printf("\tNumCPU = %v\n\n", runtime.NumCPU())
+
+			fmt.Printf("Duration: %s\n\n", time.Since(startTime))
+
+			pipeline.PrintStatus()
+
+			time.Sleep(500 * time.Millisecond)
+		}
+	}()
+
 	<-done
+	time.Sleep(2 * time.Second)
+	pipeline.PrintStatus()
 }
 
-type SimpleProcessor struct{
+func bToMb(b uint64) uint64 {
+	return b / 1024 / 1024
+}
+
+type SimpleProcessor struct {
 	sync.Mutex
 	callCount int
 }
@@ -186,11 +264,17 @@ func (p *PassthroughProcessor) Name() string {
 	return "PassthroughProcessor"
 }
 
-type AccountsOnlyFilter struct {
-	SimpleProcessor
+func (n *PassthroughProcessor) IsConcurrent() bool {
+	return true
 }
 
-func (p *AccountsOnlyFilter) ProcessState(store *Store, r io.StateReader, w io.StateWriteCloser) error {
+type EntryTypeFilter struct {
+	SimpleProcessor
+
+	Type xdr.LedgerEntryType
+}
+
+func (p *EntryTypeFilter) ProcessState(store *Store, r io.StateReader, w io.StateWriteCloser) error {
 	for {
 		entry, err := r.Read()
 		if err != nil {
@@ -201,7 +285,7 @@ func (p *AccountsOnlyFilter) ProcessState(store *Store, r io.StateReader, w io.S
 			}
 		}
 
-		if entry.Data.Type == xdr.LedgerEntryTypeAccount {
+		if entry.Data.Type == p.Type {
 			w.Write(entry)
 		}
 	}
@@ -210,8 +294,45 @@ func (p *AccountsOnlyFilter) ProcessState(store *Store, r io.StateReader, w io.S
 	return nil
 }
 
-func (p *AccountsOnlyFilter) Name() string {
-	return "AccountsOnlyFilter"
+func (p *EntryTypeFilter) Name() string {
+	return fmt.Sprintf("EntryTypeFilter (%s)", p.Type)
+}
+
+type AccountsForSignerProcessor struct {
+	SimpleProcessor
+
+	Signer string
+}
+
+func (p *AccountsForSignerProcessor) ProcessState(store *Store, r io.StateReader, w io.StateWriteCloser) error {
+	for {
+		entry, err := r.Read()
+		if err != nil {
+			if err == io.EOF {
+				break
+			} else {
+				return err
+			}
+		}
+
+		if entry.Data.Type != xdr.LedgerEntryTypeAccount {
+			continue
+		}
+
+		for _, signer := range entry.Data.Account.Signers {
+			if signer.Key.Address() == p.Signer {
+				w.Write(entry)
+				break
+			}
+		}
+	}
+
+	w.Close()
+	return nil
+}
+
+func (p *AccountsForSignerProcessor) Name() string {
+	return "AccountsForSignerProcessor"
 }
 
 type CountPrefixProcessor struct {
@@ -238,18 +359,24 @@ func (p *CountPrefixProcessor) ProcessState(store *Store, r io.StateReader, w io
 		address := entry.Data.Account.AccountId.Address()
 
 		if strings.HasPrefix(address, p.Prefix) {
+			w.Write(entry)
 			count++
+		}
+
+		if p.Prefix == "GA" {
+			// Make it slower to test full buffer
+			// time.Sleep(50 * time.Millisecond)
 		}
 	}
 
 	store.Lock()
-	prevCount := store.Get("count"+p.Prefix)
+	prevCount := store.Get("count" + p.Prefix)
 	if prevCount != nil {
 		count += prevCount.(int)
 	}
 	store.Put("count"+p.Prefix, count)
 	store.Unlock()
-	
+
 	return nil
 }
 
@@ -258,14 +385,14 @@ func (p *CountPrefixProcessor) IsConcurrent() bool {
 }
 
 func (p *CountPrefixProcessor) Name() string {
-	return "CountPrefixProcessor"
+	return fmt.Sprintf("CountPrefixProcessor (%s)", p.Prefix)
 }
 
-type PrintProcessor struct {
+type PrintCountersProcessor struct {
 	SimpleProcessor
 }
 
-func (p *PrintProcessor) ProcessState(store *Store, r io.StateReader, w io.StateWriteCloser) error {
+func (p *PrintCountersProcessor) ProcessState(store *Store, r io.StateReader, w io.StateWriteCloser) error {
 	defer w.Close()
 
 	// This should be a helper function or a method on `io.StateReader`.
@@ -294,6 +421,37 @@ func (p *PrintProcessor) ProcessState(store *Store, r io.StateReader, w io.State
 	return nil
 }
 
-func (p *PrintProcessor) Name() string {
-	return "PrintProcessor"
+func (p *PrintCountersProcessor) Name() string {
+	return "PrintCountersProcessor"
+}
+
+type PrintAllProcessor struct {
+	SimpleProcessor
+}
+
+func (p *PrintAllProcessor) ProcessState(store *Store, r io.StateReader, w io.StateWriteCloser) error {
+	defer w.Close()
+
+	entries := 0
+	for {
+		_, err := r.Read()
+		if err != nil {
+			if err == io.EOF {
+				break
+			} else {
+				return err
+			}
+		}
+
+		entries++
+		// fmt.Printf("%+v\n", entry)
+	}
+
+	fmt.Printf("Found %d entries\n", entries)
+
+	return nil
+}
+
+func (p *PrintAllProcessor) Name() string {
+	return "PrintAllProcessor"
 }
