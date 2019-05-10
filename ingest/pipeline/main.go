@@ -1,29 +1,28 @@
 package pipeline
 
 import (
-	"io"
 	"sync"
+
+	"github.com/stellar/go/ingest/io"
+	"github.com/stellar/go/xdr"
 )
 
-// Proof of concept types
-type (
-	StateReader      = io.Reader
-	StateWriteCloser = io.WriteCloser
-)
-
-type BufferedStateReadWriteCloser struct {
+type bufferedStateReadWriteCloser struct {
 	initOnce sync.Once
-	closed   chan bool
-	buffer   chan byte
+	// closed   chan bool
+	buffer   chan xdr.LedgerEntry
+}
+
+type multiWriteCloser struct {
+	writers []io.StateWriteCloser
+
+	mutex sync.Mutex
+	closeAfter int
 }
 
 type Pipeline struct {
 	rootStateProcessor *PipelineNode
 	done               bool
-}
-
-type multiWriteCloser struct {
-	writers []StateWriteCloser
 }
 
 type PipelineNode struct {
@@ -33,15 +32,21 @@ type PipelineNode struct {
 
 // StateProcessor defines methods required by state processing pipeline.
 type StateProcessor interface {
-	// ProcessState ...
-	ProcessState(store *Store, reader StateReader, writeCloser StateWriteCloser) (err error)
-	// IsConcurent defines if processing pipeline should start a single instance
+	// ProcessState is a main method of `StateProcessor`. It receives `io.StateReader`
+	// that contains object passed down the pipeline from the previous procesor. Writes to
+	// `io.StateWriteCloser` will be passed to the next processor. WARNING! `ProcessState`
+	// should **always** call `Close()` on `io.StateWriteCloser` when no more object will be
+	// written.
+	// Data required by following processors (like aggregated data) should be saved in
+	// `Store`. Read `Store` godoc to understand how to use it.
+	ProcessState(store *Store, reader io.StateReader, writeCloser io.StateWriteCloser) (err error)
+	// IsConcurrent defines if processing pipeline should start a single instance
 	// of the processor or multiple instances. Multiple instances will read
 	// from the same StateReader and write to the same StateWriter.
 	// Example: you can calculate number of asset holders in a single processor but
 	// you can also start multiple processors that sum asset holders in a shared
 	// variable to calculate it faster.
-	IsConcurent() bool
+	IsConcurrent() bool
 	// RequiresInput defines if processor requires input data (StateReader). If not,
 	// it will receive empty reader, it's parent process will write to "void" and
 	// writes to `writer` will go to "void".
@@ -52,6 +57,15 @@ type StateProcessor interface {
 	Name() string
 }
 
+// Store allows storing data connected to pipeline execution.
+// It exposes `Lock()` and `Unlock()` methods that must be called
+// when accessing the `Store` for both `Put` and `Get` calls.
+//
+// Example (incrementing a number):
+// s.Lock()
+// v := s.Get("value")
+// s.Put("value", v.(int)+1)
+// s.Unlock()
 type Store struct {
 	sync.Mutex
 	initOnce sync.Once

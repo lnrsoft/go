@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"sync"
+
+	"github.com/stellar/go/ingest/io"
 )
 
 func (p *Pipeline) Node(processor StateProcessor) *PipelineNode {
@@ -14,35 +16,46 @@ func (p *Pipeline) AddStateProcessorTree(rootProcessor *PipelineNode) {
 	p.rootStateProcessor = rootProcessor
 }
 
-func (p *Pipeline) ProcessState(reader StateReader) (done chan error) {
+func (p *Pipeline) ProcessState(reader io.StateReader) (done chan error) {
 	return p.processStateNode(&Store{}, p.rootStateProcessor, reader)
 }
 
-func (p *Pipeline) processStateNode(store *Store, node *PipelineNode, reader StateReader) chan error {
-	outputs := make([]StateWriteCloser, len(node.Children))
+func (p *Pipeline) processStateNode(store *Store, node *PipelineNode, reader io.StateReader) chan error {
+	outputs := make([]io.StateWriteCloser, len(node.Children))
 
 	for i := range outputs {
-		outputs[i] = &BufferedStateReadWriteCloser{}
+		outputs[i] = &bufferedStateReadWriteCloser{}
 	}
 
-	writer := &multiWriteCloser{writers: outputs}
-
 	var wg sync.WaitGroup
-	wg.Add(1)
+	
+	jobs := 1
+	if node.Processor.IsConcurrent() {
+		jobs = 10
+	}
 
-	go func(reader StateReader, writer StateWriteCloser) {
-		defer wg.Done()
-		err := node.Processor.ProcessState(store, reader, writer)
-		if err != nil {
-			panic(err)
-		}
-	}(reader, writer)
+	writer := &multiWriteCloser{
+		writers: outputs,
+		closeAfter: jobs,
+	}
+
+	for i := 1; i <= jobs; i++ {
+		wg.Add(1)
+		go func(reader io.StateReader, writer io.StateWriteCloser) {
+			defer wg.Done()
+			err := node.Processor.ProcessState(store, reader, writer)
+			if err != nil {
+				// TODO return to pipeline error channel
+				panic(err)
+			}
+		}(reader, writer)
+	}
 
 	for i, child := range node.Children {
 		wg.Add(1)
 		go func(i int, child *PipelineNode) {
 			defer wg.Done()
-			done := p.processStateNode(store, child, outputs[i].(*BufferedStateReadWriteCloser))
+			done := p.processStateNode(store, child, outputs[i].(*bufferedStateReadWriteCloser))
 			<-done
 		}(i, child)
 	}

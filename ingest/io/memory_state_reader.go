@@ -158,20 +158,20 @@ func (msr *MemoryStateReader) GetSequence() uint32 {
 }
 
 // Read returns a new ledger entry on each call, returning false when the stream ends
-func (msr *MemoryStateReader) Read() (bool, xdr.LedgerEntry, error) {
+func (msr *MemoryStateReader) Read() (xdr.LedgerEntry, error) {
 	if !msr.active {
-		return false, xdr.LedgerEntry{}, fmt.Errorf("memory state reader not active, need to call BufferReads() before calling Read()")
+		return xdr.LedgerEntry{}, fmt.Errorf("memory state reader not active, need to call BufferReads() before calling Read()")
 	}
 
 	// blocking call. anytime we consume from this channel, the background goroutine will stream in the next value
 	result, ok := <-msr.readChan
 	if !ok {
 		// when channel is closed then return false with empty values
-		return false, xdr.LedgerEntry{}, nil
+		return xdr.LedgerEntry{}, nil
 	}
 
 	if result.e != nil {
-		return true, xdr.LedgerEntry{}, fmt.Errorf("error while reading from background channel: %s", result.e)
+		return xdr.LedgerEntry{}, fmt.Errorf("error while reading from background channel: %s", result.e)
 	}
-	return true, result.entry, nil
+	return result.entry, nil
 }

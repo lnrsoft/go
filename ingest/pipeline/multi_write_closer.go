@@ -1,31 +1,28 @@
 package pipeline
 
 import (
-	"io"
-
-	"github.com/stellar/go/support/errors"
+	"github.com/stellar/go/xdr"
 )
 
-func (t *multiWriteCloser) Write(p []byte) (n int, err error) {
+func (t *multiWriteCloser) Write(entry xdr.LedgerEntry) error {
 	for _, w := range t.writers {
-		// BufferedStateReadWriteCloser supports writing only one byte
-		// at a time so loop over more bytes
-		for _, rb := range p {
-			n, err = w.Write([]byte{rb})
-			if err != nil {
-				return
-			}
-
-			if n != 1 {
-				err = errors.Wrap(io.ErrShortWrite, "multiWriteCloser")
-				return
-			}
+		err := w.Write(entry)
+		if err != nil {
+			return err
 		}
 	}
-	return len(p), nil
+	return nil
 }
 
 func (m *multiWriteCloser) Close() error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	m.closeAfter--
+	if m.closeAfter > 0 {
+		return nil
+	}
+
 	for _, w := range m.writers {
 		err := w.Close()
 		if err != nil {

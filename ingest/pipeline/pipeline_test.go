@@ -2,55 +2,150 @@ package pipeline
 
 import (
 	"fmt"
-	"io"
-	"io/ioutil"
-	"strings"
 	"testing"
 	"time"
+	"sync"
+	"strings"
+
+	"github.com/stellar/go/ingest/io"
+	"github.com/stellar/go/xdr"
+	"github.com/stellar/go/keypair"
 )
 
-func TestBuffer(t *testing.T) {
-	buffer := &BufferedStateReadWriteCloser{}
+func AccountLedgerEntry() xdr.LedgerEntry {
+	random, err := keypair.Random()
+	if err != nil {
+		panic(err)
+	}
 
-	go func() {
-		read, err := ioutil.ReadAll(buffer)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Println(read)
-	}()
+	id := xdr.AccountId{}
+	id.SetAddress(random.Address())
 
-	buffer.WriteCloseString("test")
-	time.Sleep(time.Second)
+	return xdr.LedgerEntry{
+		LastModifiedLedgerSeq: 0,
+		Data: xdr.LedgerEntryData{
+			Type: xdr.LedgerEntryTypeAccount,
+			Account: &xdr.AccountEntry{
+				AccountId: id,
+			},
+		},
+	}
 }
 
-func TestAbc(t *testing.T) {
+func TrustLineLedgerEntry() xdr.LedgerEntry {
+	random, err := keypair.Random()
+	if err != nil {
+		panic(err)
+	}
+
+	id := xdr.AccountId{}
+	id.SetAddress(random.Address())
+
+	return xdr.LedgerEntry{
+		LastModifiedLedgerSeq: 0,
+		Data: xdr.LedgerEntryData{
+			Type: xdr.LedgerEntryTypeTrustline,
+			TrustLine: &xdr.TrustLineEntry{
+				AccountId: id,
+			},
+		},
+	}
+}
+
+func TestStore(t *testing.T) {
+	var s Store
+
+	s.Lock()
+	s.Put("value", 0)
+	s.Unlock()
+
+	s.Lock()
+	v := s.Get("value")
+	s.Put("value", v.(int)+1)
+	s.Unlock()
+
+	fmt.Println(s.Get("value"))
+}
+
+func TestBuffer(t *testing.T) {
+	buffer := &bufferedStateReadWriteCloser{}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for {
+			entry, err := buffer.Read()
+			if err != nil {
+				if err == io.EOF {
+					break
+				} else {
+					panic(err)
+				}
+			}
+			fmt.Println("Read", entry.Data.Account.AccountId.Address())
+			time.Sleep(4*time.Second)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			buffer.Write(AccountLedgerEntry())
+			fmt.Println("Wrote")
+			time.Sleep(time.Second)
+		}
+		buffer.Close()
+	}()
+
+	wg.Wait()
+}
+
+func TestPipeline(t *testing.T) {
 	pipeline := &Pipeline{}
 
 	passthroughProcessor := &PassthroughProcessor{}
-	uppercaseProcessor := &UppercaseProcessor{}
-	lowercaseProcessor := &LowercaseProcessor{}
+	accountsOnlyFilter := &AccountsOnlyFilter{}
 	printProcessor := &PrintProcessor{}
 
 	pipeline.AddStateProcessorTree(
 		pipeline.Node(passthroughProcessor).
 			Pipe(
-				pipeline.Node(lowercaseProcessor).
-					Pipe(pipeline.Node(printProcessor)),
-				pipeline.Node(uppercaseProcessor).
-					Pipe(pipeline.Node(printProcessor)),
-			),
+				pipeline.Node(accountsOnlyFilter).
+					Pipe(
+						pipeline.Node(&CountPrefixProcessor{Prefix: "GA"}).
+							Pipe(pipeline.Node(printProcessor)),
+						pipeline.Node(&CountPrefixProcessor{Prefix: "GB"}).
+							Pipe(pipeline.Node(printProcessor)),
+						pipeline.Node(&CountPrefixProcessor{Prefix: "GC"}).
+							Pipe(pipeline.Node(printProcessor)),
+						pipeline.Node(&CountPrefixProcessor{Prefix: "GD"}).
+							Pipe(pipeline.Node(printProcessor)),
+					),
+				),
 	)
 
-	buffer := &BufferedStateReadWriteCloser{}
-	go buffer.WriteCloseString("testTEST")
+	buffer := &bufferedStateReadWriteCloser{}
+	
+	go func() {
+		for i := 0; i < 10000; i++ {
+			buffer.Write(AccountLedgerEntry())
+			buffer.Write(TrustLineLedgerEntry())
+		}
+		buffer.Close()
+	}()
+
 	done := pipeline.ProcessState(buffer)
 	<-done
 }
 
-type SimpleProcessor struct{}
+type SimpleProcessor struct{
+	sync.Mutex
+	callCount int
+}
 
-func (n *SimpleProcessor) IsConcurent() bool {
+func (n *SimpleProcessor) IsConcurrent() bool {
 	return false
 }
 
@@ -58,14 +153,29 @@ func (n *SimpleProcessor) RequiresInput() bool {
 	return true
 }
 
+func (n *SimpleProcessor) CallCount() int {
+	n.Lock()
+	defer n.Unlock()
+	n.callCount++
+	return n.callCount
+}
+
 type PassthroughProcessor struct {
 	SimpleProcessor
 }
 
-func (p *PassthroughProcessor) ProcessState(store *Store, r StateReader, w StateWriteCloser) error {
-	_, err := io.Copy(w, r)
-	if err != nil {
-		return err
+func (p *PassthroughProcessor) ProcessState(store *Store, r io.StateReader, w io.StateWriteCloser) error {
+	for {
+		entry, err := r.Read()
+		if err != nil {
+			if err == io.EOF {
+				break
+			} else {
+				return err
+			}
+		}
+
+		w.Write(entry)
 	}
 
 	w.Close()
@@ -76,93 +186,111 @@ func (p *PassthroughProcessor) Name() string {
 	return "PassthroughProcessor"
 }
 
-type UppercaseProcessor struct {
+type AccountsOnlyFilter struct {
 	SimpleProcessor
 }
 
-func (p *UppercaseProcessor) ProcessState(store *Store, r StateReader, w StateWriteCloser) error {
-	defer w.Close()
-
-	lettersCount := make(map[byte]int)
+func (p *AccountsOnlyFilter) ProcessState(store *Store, r io.StateReader, w io.StateWriteCloser) error {
 	for {
-		b := make([]byte, 1)
-		rn, rerr := r.Read(b)
-		if rn == 1 {
-			lettersCount[b[0]]++
-
-			newLetter := b[0]
-			if b[0] >= 97 && b[0] <= 122 {
-				newLetter -= 32
-			}
-
-			_, werr := w.Write([]byte{newLetter})
-			if werr != nil {
-				return werr
+		entry, err := r.Read()
+		if err != nil {
+			if err == io.EOF {
+				break
+			} else {
+				return err
 			}
 		}
 
-		if rerr != nil {
-			if rerr == io.EOF {
+		if entry.Data.Type == xdr.LedgerEntryTypeAccount {
+			w.Write(entry)
+		}
+	}
+
+	w.Close()
+	return nil
+}
+
+func (p *AccountsOnlyFilter) Name() string {
+	return "AccountsOnlyFilter"
+}
+
+type CountPrefixProcessor struct {
+	SimpleProcessor
+	Prefix string
+}
+
+func (p *CountPrefixProcessor) ProcessState(store *Store, r io.StateReader, w io.StateWriteCloser) error {
+	// Close writer when we're done
+	defer w.Close()
+
+	count := 0
+
+	for {
+		entry, err := r.Read()
+		if err != nil {
+			if err == io.EOF {
 				break
 			} else {
-				return rerr
+				return err
 			}
+		}
+
+		address := entry.Data.Account.AccountId.Address()
+
+		if strings.HasPrefix(address, p.Prefix) {
+			count++
 		}
 	}
 
 	store.Lock()
-	store.Put("letterCount", lettersCount)
+	prevCount := store.Get("count"+p.Prefix)
+	if prevCount != nil {
+		count += prevCount.(int)
+	}
+	store.Put("count"+p.Prefix, count)
 	store.Unlock()
-
+	
 	return nil
 }
 
-func (p *UppercaseProcessor) Name() string {
-	return "UppercaseProcessor"
+func (p *CountPrefixProcessor) IsConcurrent() bool {
+	return true
 }
 
-type LowercaseProcessor struct {
-	SimpleProcessor
-}
-
-func (p *LowercaseProcessor) ProcessState(store *Store, r StateReader, w StateWriteCloser) error {
-	// This will read all into memory. See UppercaseProcessor for streaming
-	// example.
-	read, err := ioutil.ReadAll(r)
-	if err != nil {
-		return err
-	}
-
-	n := strings.ToLower(string(read))
-
-	defer w.Close()
-	_, err = fmt.Fprint(w, n)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (p *LowercaseProcessor) Name() string {
-	return "LowercaseProcessor"
+func (p *CountPrefixProcessor) Name() string {
+	return "CountPrefixProcessor"
 }
 
 type PrintProcessor struct {
 	SimpleProcessor
 }
 
-func (p *PrintProcessor) ProcessState(store *Store, r StateReader, w StateWriteCloser) error {
+func (p *PrintProcessor) ProcessState(store *Store, r io.StateReader, w io.StateWriteCloser) error {
 	defer w.Close()
 
-	read, err := ioutil.ReadAll(r)
-	if err != nil {
-		return err
+	// This should be a helper function or a method on `io.StateReader`.
+	for {
+		_, err := r.Read()
+		if err != nil {
+			if err == io.EOF {
+				break
+			} else {
+				return err
+			}
+		}
+	}
+
+	if p.CallCount() != 4 {
+		return nil
 	}
 
 	store.Lock()
-	fmt.Println(string(read), store.Get("letterCount"))
+	fmt.Println("countGA", store.Get("countGA"))
+	fmt.Println("countGB", store.Get("countGB"))
+	fmt.Println("countGC", store.Get("countGC"))
+	fmt.Println("countGD", store.Get("countGD"))
 	store.Unlock()
+
 	return nil
 }
 
