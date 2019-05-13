@@ -10,14 +10,14 @@ import (
 
 // ChangeTrust represents the Stellar change trust operation. See
 // https://www.stellar.org/developers/guides/concepts/list-of-operations.html.
-// If Limit is omitted,  it defaults to txnbuild.MaxTrustlineLimit; the max int64 value.
+// If Limit is omitted, it defaults to txnbuild.MaxTrustlineLimit.
 type ChangeTrust struct {
 	Line          Asset
 	Limit         string
 	SourceAccount Account
 }
 
-// MaxTrustlineLimit represents the maximum value that can be passed as trutline Limit
+// MaxTrustlineLimit represents the maximum value that can be set as a trustline limit.
 var MaxTrustlineLimit = amount.StringFromInt64(math.MaxInt64)
 
 // RemoveTrustlineOp returns a ChangeTrust operation to remove the trustline of the described asset,
