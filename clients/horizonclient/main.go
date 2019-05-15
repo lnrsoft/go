@@ -161,6 +161,8 @@ type ClientInterface interface {
 	Root() (hProtocol.Root, error)
 	NextAssetsPage(hProtocol.AssetsPage) (hProtocol.AssetsPage, error)
 	PrevAssetsPage(hProtocol.AssetsPage) (hProtocol.AssetsPage, error)
+	NextLedgersPage(hProtocol.LedgersPage) (hProtocol.LedgersPage, error)
+	PrevLedgersPage(hProtocol.LedgersPage) (hProtocol.LedgersPage, error)
 }
 
 // DefaultTestNetClient is a default client to connect to test network.
