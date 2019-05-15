@@ -64,6 +64,45 @@ func TestEffectRequestBuildUrl(t *testing.T) {
 
 }
 
+func ExampleClient_NextEffectsPage() {
+	client := DefaultPublicNetClient
+	// all effects
+	effectRequest := EffectRequest{Limit: 20}
+	efp, err := client.Effects(effectRequest)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Print(efp)
+
+	// next page
+	nextPage, err := client.NextEffectsPage(efp)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(nextPage)
+}
+
+func ExampleClient_PrevEffectsPage() {
+	client := DefaultPublicNetClient
+	// all effects
+	effectRequest := EffectRequest{Limit: 20}
+	efp, err := client.Effects(effectRequest)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Print(efp)
+
+	// prev page
+	prevPage, err := client.PrevEffectsPage(efp)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(prevPage)
+}
 func ExampleClient_StreamEffects() {
 	client := DefaultTestNetClient
 	// all effects
